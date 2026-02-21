@@ -8,16 +8,19 @@ pipeline {
 
     environment {
         SCANNER_HOME = tool 'sonar-scanner'
+        IMAGE_NAME = "pragadeesh2102/amazon"
+        IMAGE_TAG = "${BUILD_NUMBER}"
     }
 
     stages {
+
         stage("Clean Workspace") {
             steps {
                 cleanWs()
             }
         }
 
-        stage("Git Checkout") {
+        stage("Checkout Code") {
             steps {
                 git branch: 'main', url: 'https://github.com/pragadeesh2102/amazon-Devsecops.git'
             }
@@ -26,44 +29,48 @@ pipeline {
         stage("SonarQube Analysis") {
             steps {
                 withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner \
-                        -Dsonar.projectName=amazon \
-                        -Dsonar.projectKey=amazon '''
+                    sh """
+                    ${SCANNER_HOME}/bin/sonar-scanner \
+                    -Dsonar.projectName=amazon \
+                    -Dsonar.projectKey=amazon
+                    """
                 }
             }
         }
 
         stage("Quality Gate") {
             steps {
-            
-        timeout(time: 10, unit: 'MINUTES') {
-            waitForQualityGate abortPipeline: false
-        }
-    
-        }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
         }
 
-        stage("Install NPM Dependencies") {
+        stage("Install Dependencies") {
             steps {
                 sh "npm install"
             }
         }
-        
-       
-        stage("OWASP FS Scan") {
-            steps {
-                dependencyCheck additionalArguments: '''
-                    --scan ./ 
-                    --disableYarnAudit 
-                    --disableNodeAudit 
-                
-                   ''',
-                odcInstallation: 'dp-check'
 
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+        stage("OWASP Dependency Check") {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    dependencyCheck additionalArguments: """
+                        --scan ./ 
+                        --disableYarnAudit 
+                        --disableNodeAudit 
+                        --nvdApiKey=${NVD_API_KEY}
+                    """,
+                    odcInstallation: 'dp-check'
+                }
             }
         }
 
+        stage("Publish OWASP Report") {
+            steps {
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
 
         stage("Trivy File Scan") {
             steps {
@@ -73,91 +80,65 @@ pipeline {
 
         stage("Build Docker Image") {
             steps {
-                script {
-                    env.IMAGE_TAG = "pragadeesh2102/amazon:${BUILD_NUMBER}"
-
-                    // Optional cleanup
-                    sh "docker rmi -f amazon ${env.IMAGE_TAG} || true"
-
-                    sh "docker build -t amazon ."
-                }
+                sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
             }
         }
 
-        stage("Tag & Push to DockerHub") {
+        stage("Trivy Image Scan") {
             steps {
-                script {
-                    withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-                        sh "docker login -u pragadeesh2102 -p ${dockerpwd}"
-                        sh "docker tag amazon ${env.IMAGE_TAG}"
-                        sh "docker push ${env.IMAGE_TAG}"
-
-                        // Also push latest
-                        sh "docker tag amazon pragadeesh2102/amazon:latest"
-                        sh "docker push pragadeesh2102/amazon:latest"
-                    }
-                }
-            }
-        }
-
-       
-
-        stage("Trivy Scan Image") {
-            steps {
-                script {
-                    sh """
-                    echo '🔍 Running Trivy scan on ${env.IMAGE_TAG}'
-
-                    # JSON report
-                    trivy image -f json -o trivy-image.json ${env.IMAGE_TAG}
-
-                    # HTML report using built-in HTML format
-                    trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG}
-
-                    # Fail build if HIGH/CRITICAL vulnerabilities found
-                    # trivy image --exit-code 1 --severity HIGH,CRITICAL ${env.IMAGE_TAG} || true
+                sh """
+                trivy image --severity HIGH,CRITICAL \
+                --exit-code 1 ${IMAGE_NAME}:${IMAGE_TAG} || true
                 """
+            }
+        }
+
+        stage("Push Docker Image") {
+            steps {
+                withCredentials([string(credentialsId: 'docker-cred', variable: 'DOCKER_PWD')]) {
+                    sh """
+                    docker login -u pragadeesh2102 -p ${DOCKER_PWD}
+                    docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+                    docker push ${IMAGE_NAME}:latest
+                    """
                 }
             }
         }
 
-
-        stage("Deploy to Container") {
+        stage("Deploy Container") {
             steps {
-                script {
-                    sh "docker rm -f amazon || true"
-                    sh "docker run -d --name amazon -p 80:80 ${env.IMAGE_TAG}"
-                }
+                sh """
+                docker rm -f amazon || true
+                docker run -d -p 80:80 --name amazon ${IMAGE_NAME}:${IMAGE_TAG}
+                """
             }
         }
     }
 
-      post {
-    always {
-        script {
-            def buildStatus = currentBuild.currentResult
-            def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: ' Github User'
+    post {
+        success {
+            echo "✅ Pipeline executed successfully!"
+        }
 
+        failure {
+            echo "❌ Pipeline failed. Check logs."
+        }
+
+        always {
             emailext (
-                subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                subject: "Build ${currentBuild.currentResult}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                 body: """
-                    <p>This is a Jenkins Amazon CICD pipeline status.</p>
-                    <p>Project: ${env.JOB_NAME}</p>
-                    <p>Build Number: ${env.BUILD_NUMBER}</p>
-                    <p>Build Status: ${buildStatus}</p>
-                    <p>Started by: ${buildUser}</p>
-                    <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                <h3>DevSecOps Pipeline Status</h3>
+                <p><b>Project:</b> ${env.JOB_NAME}</p>
+                <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+                <p><b>Status:</b> ${currentBuild.currentResult}</p>
+                <p><b>URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
                 """,
                 to: 'pragadeeshuthamarajan@gmail.com',
-                from: 'pragadeeshuthamarajan@gmail.com',
                 mimeType: 'text/html',
-                attachmentsPattern: 'trivyfs.txt,trivy-image.json,trivy-image.txt,dependency-check-report.xml'
-                    )
+                attachmentsPattern: 'trivyfs.txt,dependency-check-report.xml'
+            )
         }
     }
 }
-}
-
-
-
-
