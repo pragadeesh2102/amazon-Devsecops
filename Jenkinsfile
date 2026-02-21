@@ -52,8 +52,10 @@ pipeline {
             }
         }
 
-        stage("OWASP Dependency Check") {
-            steps {
+        stage("OWASP FS Scan") {
+    steps {
+        script {
+            withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     dependencyCheck additionalArguments: """
                         --scan ./ 
@@ -65,6 +67,8 @@ pipeline {
                 }
             }
         }
+    }
+}
 
         stage("Publish OWASP Report") {
             steps {
